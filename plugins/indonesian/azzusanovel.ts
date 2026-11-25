@@ -1,13 +1,45 @@
-import { fetchApi } from '@libs/fetch';
+import * as fetchLib from '@libs/fetch';
 import { Plugin } from '@/types/plugin';
 import { NovelStatus } from '@libs/novelStatus';
 import { CheerioAPI, load as parseHTML } from 'cheerio';
+
+const { fetchApi } = fetchLib;
 
 const SITE = 'https://azzusanovel.wordpress.com';
 
 /** The site is a WordPress.com blog; its public REST API is not bot-blocked. */
 const API =
   'https://public-api.wordpress.com/wp/v2/sites/azzusanovel.wordpress.com';
+const API_V1 =
+  'https://public-api.wordpress.com/rest/v1.1/sites/azzusanovel.wordpress.com';
+
+/**
+ * WordPress.com's bot protection refuses some non-browser request shapes with
+ * HTTP 403. Sending a browser User-Agent plus the headers a browser would send
+ * is what other plugins in this repo do for the same reason.
+ */
+const USER_AGENT =
+  'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36';
+
+const API_HEADERS = {
+  'User-Agent': USER_AGENT,
+  'Accept': 'application/json, text/plain, */*',
+  'Accept-Language': 'id-ID,id;q=0.9,en;q=0.8',
+  'Sec-Fetch-Mode': 'cors',
+  'Sec-Fetch-Site': 'cross-site',
+  'Sec-Fetch-Dest': 'empty',
+};
+
+const HTML_HEADERS = {
+  'User-Agent': USER_AGENT,
+  'Accept':
+    'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+  'Accept-Language': 'id-ID,id;q=0.9,en;q=0.8',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'none',
+  'Sec-Fetch-Dest': 'document',
+  'Upgrade-Insecure-Requests': '1',
+};
 
 const NOVELS: Plugin.NovelItem[] = [
   {
@@ -54,6 +86,12 @@ type ApiPage = {
   content?: { rendered: string };
 };
 
+type ApiV1Post = {
+  ID: number;
+  URL: string;
+  content?: string;
+};
+
 /**
  * Read a page through the public WordPress.com REST API. The theme markup
  * answers 403 to requests from the app, while the API keeps working. Returns
@@ -64,20 +102,67 @@ const getApiPage = async (path: string): Promise<string | undefined> => {
 
   if (!slug) return undefined;
 
-  const response = await fetchApi(
-    `${API}/pages?slug=${encodeURIComponent(slug)}` +
-      '&_fields=id,slug,link,content',
-  );
+  try {
+    const response = await fetchApi(
+      `${API}/pages?slug=${encodeURIComponent(slug)}` +
+        '&_fields=id,slug,link,content',
+      { headers: API_HEADERS },
+    );
 
-  if (!response.ok) return undefined;
+    if (response.ok) {
+      const pages = (await response.json()) as ApiPage[];
 
-  const pages = (await response.json()) as ApiPage[];
+      const page =
+        pages.find(item => normalizePath(item.link) === path) ||
+        (pages.length === 1 ? pages[0] : undefined);
 
-  const page =
-    pages.find(item => normalizePath(item.link) === path) ||
-    (pages.length === 1 ? pages[0] : undefined);
+      if (page?.content?.rendered) return page.content.rendered;
+    }
+  } catch {
+    // Try the v1.1 route below.
+  }
 
-  return page?.content?.rendered;
+  // v1.1 is a separate route on the API host; it sometimes answers when v2
+  // does not. Only trust it when the returned URL is the page we asked for.
+  try {
+    const response = await fetchApi(
+      `${API_V1}/posts/slug:${encodeURIComponent(slug)}` +
+        '?fields=ID,URL,content',
+      { headers: API_HEADERS },
+    );
+
+    if (!response.ok) return undefined;
+
+    const post = (await response.json()) as ApiV1Post;
+
+    return normalizePath(post.URL) === path ? post.content : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const getPageViaWebview = async (path: string): Promise<string | undefined> => {
+  const fetchViaWebview = (
+    fetchLib as {
+      fetchViaWebview?: (
+        url: string,
+        options?: { timeoutMs?: number; settleMs?: number },
+      ) => Promise<{ ok: boolean; html: string }>;
+    }
+  ).fetchViaWebview;
+
+  if (typeof fetchViaWebview !== 'function') return undefined;
+
+  try {
+    const result = await fetchViaWebview(`${SITE}${path}`, {
+      timeoutMs: 15000,
+      settleMs: 500,
+    });
+
+    return result?.ok && result.html.trim() ? result.html : undefined;
+  } catch {
+    return undefined;
+  }
 };
 
 const getPage = async (input: string): Promise<string> => {
@@ -96,17 +181,18 @@ const getPage = async (input: string): Promise<string> => {
   }
 
   const response = await fetchApi(`${SITE}${path}`, {
-    headers: {
-      Accept: 'text/html,application/xhtml+xml',
-      'Accept-Language': 'id-ID,id;q=0.9,en;q=0.8',
-    },
+    headers: HTML_HEADERS,
   });
 
-  if (!response.ok) {
-    throw new Error(`AzzusaNovel request failed: ${response.status} ${path}`);
-  }
+  if (response.ok) return response.text();
 
-  return response.text();
+  // Last resort: load the page in a real WebView, which passes the browser
+  // check that plain requests fail. Older app builds do not provide this.
+  const webviewHTML = await getPageViaWebview(path);
+
+  if (webviewHTML) return webviewHTML;
+
+  throw new Error(`AzzusaNovel request failed: ${response.status} ${path}`);
 };
 
 const getContent = ($: CheerioAPI) => {
@@ -145,7 +231,18 @@ class AzzusaNovel implements Plugin.PluginBase {
   name = 'AzzusaNovel';
   icon = 'src/id/azzusanovel/icon.webp';
   site = SITE;
-  version = '1.1.2';
+  version = '1.1.3';
+
+  // WordPress.com's image CDN also refuses the app's default User-Agent, so
+  // covers and in-chapter images need the same browser headers as pages.
+  imageRequestInit: Plugin.ImageRequestInit = {
+    method: 'GET',
+    headers: {
+      'User-Agent': USER_AGENT,
+      'Referer': `${SITE}/`,
+      'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+    },
+  };
 
   async popularNovels(pageNo = 1): Promise<Plugin.NovelItem[]> {
     return pageNo === 1 ? NOVELS : [];
