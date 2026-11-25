@@ -5,6 +5,10 @@ import { CheerioAPI, load as parseHTML } from 'cheerio';
 
 const SITE = 'https://azzusanovel.wordpress.com';
 
+/** The site is a WordPress.com blog; its public REST API is not bot-blocked. */
+const API =
+  'https://public-api.wordpress.com/wp/v2/sites/azzusanovel.wordpress.com';
+
 const NOVELS: Plugin.NovelItem[] = [
   {
     name: 'Omniscient Reader’s Viewpoint',
@@ -43,6 +47,39 @@ const normalizePath = (input: string): string => {
   }
 };
 
+type ApiPage = {
+  id: number;
+  slug: string;
+  link: string;
+  content?: { rendered: string };
+};
+
+/**
+ * Read a page through the public WordPress.com REST API. The theme markup
+ * answers 403 to requests from the app, while the API keeps working. Returns
+ * `undefined` when the page cannot be resolved so the caller can fall back.
+ */
+const getApiPage = async (path: string): Promise<string | undefined> => {
+  const slug = path.split('/').filter(Boolean).pop();
+
+  if (!slug) return undefined;
+
+  const response = await fetchApi(
+    `${API}/pages?slug=${encodeURIComponent(slug)}` +
+      '&_fields=id,slug,link,content',
+  );
+
+  if (!response.ok) return undefined;
+
+  const pages = (await response.json()) as ApiPage[];
+
+  const page =
+    pages.find(item => normalizePath(item.link) === path) ||
+    (pages.length === 1 ? pages[0] : undefined);
+
+  return page?.content?.rendered;
+};
+
 const getPage = async (input: string): Promise<string> => {
   const path = normalizePath(input);
 
@@ -50,7 +87,20 @@ const getPage = async (input: string): Promise<string> => {
     throw new Error(`Invalid AzzusaNovel URL: ${input}`);
   }
 
-  const response = await fetchApi(`${SITE}${path}`);
+  try {
+    const apiHTML = await getApiPage(path);
+
+    if (apiHTML && apiHTML.trim()) return apiHTML;
+  } catch {
+    // Ignore and try the page itself below.
+  }
+
+  const response = await fetchApi(`${SITE}${path}`, {
+    headers: {
+      Accept: 'text/html,application/xhtml+xml',
+      'Accept-Language': 'id-ID,id;q=0.9,en;q=0.8',
+    },
+  });
 
   if (!response.ok) {
     throw new Error(`AzzusaNovel request failed: ${response.status} ${path}`);
@@ -95,7 +145,7 @@ class AzzusaNovel implements Plugin.PluginBase {
   name = 'AzzusaNovel';
   icon = 'src/id/azzusanovel/icon.webp';
   site = SITE;
-  version = '1.1.1';
+  version = '1.1.2';
 
   async popularNovels(pageNo = 1): Promise<Plugin.NovelItem[]> {
     return pageNo === 1 ? NOVELS : [];
