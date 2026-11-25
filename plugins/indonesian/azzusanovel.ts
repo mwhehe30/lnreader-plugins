@@ -253,3 +253,5 @@ class AzzusaNovel implements Plugin.PluginBase {
 }
 
 export default new AzzusaNovel();
+
+// Trigger plugin publishing
