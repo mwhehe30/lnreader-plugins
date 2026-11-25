@@ -95,7 +95,7 @@ class AzzusaNovel implements Plugin.PluginBase {
   name = 'AzzusaNovel';
   icon = 'src/id/azzusanovel/icon.webp';
   site = SITE;
-  version = '1.1.0';
+  version = '1.1.1';
 
   async popularNovels(pageNo = 1): Promise<Plugin.NovelItem[]> {
     return pageNo === 1 ? NOVELS : [];
